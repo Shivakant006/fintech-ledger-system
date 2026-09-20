@@ -3,22 +3,15 @@ from sqlalchemy.exc import IntegrityError
 from . import models, schemas
 
 def execute_payment(db: Session, payment_data: schemas.PaymentRequest) -> models.Transaction:
-    # A try/except block is mandatory. If any step fails, we MUST rollback.
     try:
-        # -------------------------------------------------------------------
-        # 1. PREVENT DEADLOCKS (The Senior Engineer Secret)
-        # If Server A locks [User1, User2] and Server B locks [User2, User1], 
-        # they will freeze forever waiting for each other. 
-        # We solve this by ALWAYS locking rows in a consistent order (alphabetical by UUID).
-        # -------------------------------------------------------------------
         account_ids = sorted([
             str(payment_data.user_account_id), 
             str(payment_data.merchant_account_id)
         ])
         
         # -------------------------------------------------------------------
-        # 2. THE ROW LOCK (SELECT FOR UPDATE)
-        # Fetch both accounts and lock them. Other servers will pause here.
+        # 2. THE ROW LOCK 
+        # Fetch both accounts and lock them.
         # -------------------------------------------------------------------
         accounts = db.query(models.Account).filter(
             models.Account.id.in_(account_ids)
@@ -77,7 +70,6 @@ def execute_payment(db: Session, payment_data: schemas.PaymentRequest) -> models
         # -------------------------------------------------------------------
         # 7. COMMIT & RELEASE LOCKS
         # -------------------------------------------------------------------
-        # This saves everything atomically. If the power goes out right now, 
         # the transaction is safely recorded. The Row Locks are released.
         db.commit()
         return new_txn
