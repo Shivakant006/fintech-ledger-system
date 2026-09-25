@@ -21,8 +21,11 @@ def process_message(message: pubsub_v1.subscriber.message.Message):
         payload = json.loads(message.data.decode("utf-8"))
         print(f"[WORKER] Processing Payment for {payload.get('amount_cents')} cents...")
         
-        # 2. Validate it using our existing Pydantic schema
-        payment_data = schemas.PaymentRequest(**payload)
+        # 2. Validate it using PaymentTask — the internal schema that
+        # includes transaction_id (PaymentRequest is client-facing only
+        # and deliberately has no transaction_id field, since the client
+        # never sends one).
+        payment_data = schemas.PaymentTask(**payload)
         
         # 3. Open a database session
         db = SessionLocal()
@@ -36,6 +39,15 @@ def process_message(message: pubsub_v1.subscriber.message.Message):
             # This tells Pub/Sub: "I successfully processed this. Delete it from the queue."
             message.ack()
             
+        except DuplicateTransactionError as e:
+            # This exact payment was already settled — either an earlier
+            # attempt succeeded and this is a Pub/Sub redelivery, or a
+            # concurrent worker won the race. Either way, this is not a
+            # new payment and not a failure: ack it so it's removed from
+            # the queue, and do NOT touch account balances again.
+            print(f"[WORKER] DUPLICATE (already settled): {e}")
+            message.ack()
+
         except ValueError as e:
             # Business logic failure (e.g., Insufficient Funds)
             print(f"[WORKER] REJECTED (Business Rule): {e}")

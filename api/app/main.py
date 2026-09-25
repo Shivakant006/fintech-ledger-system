@@ -41,17 +41,19 @@ def process_payment(
     transaction_id = uuid.uuid4()
 
     # 3. CONSTRUCT THE TICKET (The Pub/Sub Message payload)
-    message_data = {
-        "transaction_id": str(transaction_id),
-        "idempotency_key": request.idempotency_key,
-        "user_account_id": str(request.user_account_id),
-        "merchant_account_id": str(request.merchant_account_id),
-        "amount_cents": request.amount_cents,
-        "description": request.description
-    }
-    
+    # Build a PaymentTask — everything the client sent in `request`, PLUS
+    # the transaction_id we just generated. Building it as a real schema
+    # object (instead of a hand-typed dict) means if PaymentRequest ever
+    # gains a new field, it's automatically included here too — nothing
+    # to remember to update in two places.
+    task = schemas.PaymentTask(
+        **request.model_dump(),
+        transaction_id=transaction_id,
+    )
+
     # Pub/Sub requires messages to be bytes, not dictionaries.
-    message_bytes = json.dumps(message_data).encode("utf-8")
+    # mode="json" makes sure UUID objects are serialized as strings.
+    message_bytes = json.dumps(task.model_dump(mode="json")).encode("utf-8")
 
     # 4. PUBLISH TO THE RAIL
     try:

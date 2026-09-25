@@ -14,6 +14,20 @@ class PaymentRequest(BaseModel):
     amount_cents: int = Field(..., gt=0, description="Amount in cents (e.g., 500 for $5.00)")
     description: Optional[str] = "Payment"
 
+class PaymentTask(PaymentRequest):
+    """
+    Internal-only schema used for the Pub/Sub message payload.
+
+    This is everything a client-submitted PaymentRequest has, PLUS the
+    transaction_id the API generates right after validating the request.
+    It is never used as the shape of an incoming HTTP request — a client
+    doesn't have a transaction_id yet when they call /charge, the server
+    assigns one. This is what lets the worker create the Transaction row
+    using the SAME id the client was already handed as their tracking
+    number, instead of the database silently minting a different one.
+    """
+    transaction_id: UUID
+
 class PaymentResponse(BaseModel):
     transaction_id: UUID
     status: str

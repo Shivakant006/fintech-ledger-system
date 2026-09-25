@@ -79,8 +79,14 @@ def execute_payment(db: Session, payment_data: schemas.PaymentTask) -> models.Tr
 
         # -------------------------------------------------------------------
         # 5. CREATE THE TRANSACTION RECORD
+        # We MUST pass id=payment_data.transaction_id explicitly here.
+        # Without it, SQLAlchemy's default=uuid.uuid4 on Transaction.id
+        # would silently generate a DIFFERENT id than the one already
+        # returned to the client in the /charge response — leaving the
+        # client holding a tracking number that never exists in the DB.
         # -------------------------------------------------------------------
         new_txn = models.Transaction(
+            id=payment_data.transaction_id,
             idempotency_key=payment_data.idempotency_key,
             description=payment_data.description,
             status=models.TransactionStatus.COMPLETED
@@ -109,12 +115,37 @@ def execute_payment(db: Session, payment_data: schemas.PaymentTask) -> models.Tr
         # -------------------------------------------------------------------
         # 7. COMMIT & RELEASE LOCKS
         # -------------------------------------------------------------------
+        # This saves everything atomically. If the power goes out right now, 
         # the transaction is safely recorded. The Row Locks are released.
         db.commit()
         return new_txn
 
+    except DuplicateTransactionError:
+        # Nothing was written yet (we caught this before step 1), but keep
+        # the rollback for symmetry / in case the session has other pending
+        # state from the caller.
+        db.rollback()
+        raise
+
+    except IntegrityError as e:
+        # BACKSTOP for the race condition our proactive check above can't
+        # cover: two workers both pass the SELECT check (neither has
+        # committed yet) and both try to insert. Postgres's unique
+        # constraint on idempotency_key guarantees only one insert wins;
+        # the loser lands here. We treat it the same as a normal duplicate.
+        db.rollback()
+        if "idempotency_key" in str(e.orig):
+            raise DuplicateTransactionError(
+                f"Transaction with idempotency_key={payment_data.idempotency_key} "
+                f"was inserted concurrently by another worker."
+            ) from e
+        # Some other constraint was violated (not the one we expect) —
+        # don't misreport it as a duplicate, let it surface as-is.
+        raise
+
     except Exception as e:
-        # IF ANYTHING FAILS (e.g., database constraint violation, or our ValueError),
-        # ROLLBACK the entire transaction. Undo balance changes. Release the locks.
+        # IF ANYTHING ELSE FAILS (e.g., our ValueError for business rules,
+        # a DB connection drop, a lock timeout), ROLLBACK the entire
+        # transaction. Undo balance changes. Release the locks.
         db.rollback()
         raise e
