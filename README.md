@@ -1,8 +1,8 @@
 # Distributed Event-Driven FinTech Ledger System
 
-An asynchronous, ACID-compliant double-entry ledger engine built with **FastAPI**, **PostgreSQL**, **Redis**, and **Google Cloud Pub/Sub**. 
+An asynchronous, double-entry ledger engine built with **FastAPI**, **PostgreSQL**, **Redis**, and **Google Cloud Pub/Sub**.
 
-The system decouples transaction ingestion from financial settlement, providing sub-millisecond API response times while guaranteeing zero data loss, strict idempotency, and deadlock-free concurrent execution.
+The system decouples transaction ingestion from financial settlement: the API validates a payment and responds immediately (`202 Accepted`), while a background worker performs the actual balance updates asynchronously, guarding against duplicate processing and lock-order deadlocks along the way.
 
 ---
 
@@ -13,179 +13,223 @@ The system decouples transaction ingestion from financial settlement, providing 
         │
         ▼ (POST /charge)
 ┌────────────────────────────────────────────────────────┐
-│ FastAPI Gateway (Producer)                             │
-│  ├─ 1. Validate payload (Pydantic)                     │
-│  ├─ 2. Check & Set Idempotency Key (Redis, 24h TTL)    │
-│  ├─ 3. Generate Client Transaction ID (UUID4)          │
-│  └─ 4. Publish Event to GCP Pub/Sub Topic              │
+│ FastAPI Gateway (Producer)                              │
+│  ├─ 1. Validate payload (Pydantic)                       │
+│  ├─ 2. Check idempotency key (Redis, 24h TTL)             │
+│  ├─ 3. Generate transaction_id (UUID4)                    │
+│  └─ 4. Publish event to GCP Pub/Sub topic                 │
 └────────────────────────────────────────────────────────┘
         │
         ├──────────────────────────────► Returns 202 ACCEPTED
-        ▼ (Async Event Ingestion)
+        ▼ (Async event delivery)
 ┌────────────────────────────────────────────────────────┐
-│ GCP Pub/Sub Event Bus                                  │
-│ Topic: payment-processing-topic                        │
-│ Subscription: ledger-worker-sub                        │
+│ GCP Pub/Sub Event Bus                                    │
+│ Topic: payment-processing-topic                           │
+│ Subscription: ledger-worker-sub                            │
 └────────────────────────────────────────────────────────┘
         │
-        ▼ (Pull / Event Delivery)
+        ▼ (Pull / event delivery — at-least-once)
 ┌────────────────────────────────────────────────────────┐
-│ Python Settlement Worker (Consumer)                    │
-│  ├─ 1. Ingest event payload                            │
-│  ├─ 2. Acquire Alphabetical Row Locks (FOR UPDATE)     │
-│  ├─ 3. Verify Account Balances & Business Rules        │
-│  ├─ 4. Write Double-Entry Ledger Records (PostgreSQL)  │
-│  └─ 5. Issue ACK / NACK to Pub/Sub                     │
+│ Python Settlement Worker (Consumer)                       │
+│  ├─ 1. Ingest event payload                                │
+│  ├─ 2. Reject redelivered/duplicate transactions           │
+│  ├─ 3. Acquire row locks in a deterministic order (FOR UPDATE, ORDER BY id) │
+│  ├─ 4. Verify account balances & business rules             │
+│  ├─ 5. Write double-entry ledger records (PostgreSQL)        │
+│  └─ 6. Issue ACK / NACK to Pub/Sub                          │
 └────────────────────────────────────────────────────────┘
-```text
-[Client / Frontend]
-        │
-        ▼ (POST /charge)
-┌────────────────────────────────────────────────────────┐
-│ FastAPI Gateway (Producer)                             │
-│  ├─ 1. Validate payload (Pydantic)                     │
-│  ├─ 2. Check & Set Idempotency Key (Redis, 24h TTL)    │
-│  ├─ 3. Generate Client Transaction ID (UUID4)          │
-│  └─ 4. Publish Event to GCP Pub/Sub Topic              │
-└────────────────────────────────────────────────────────┘
-        │
-        ├──────────────────────────────► Returns 202 ACCEPTED
-        ▼ (Async Event Ingestion)
-┌────────────────────────────────────────────────────────┐
-│ GCP Pub/Sub Event Bus                                  │
-│ Topic: payment-processing-topic                        │
-│ Subscription: ledger-worker-sub                        │
-└────────────────────────────────────────────────────────┘
-        │
-        ▼ (Pull / Event Delivery)
-┌────────────────────────────────────────────────────────┐
-│ Python Settlement Worker (Consumer)                    │
-│  ├─ 1. Ingest event payload                            │
-│  ├─ 2. Acquire Alphabetical Row Locks (FOR UPDATE)     │
-│  ├─ 3. Verify Account Balances & Business Rules        │
-│  ├─ 4. Write Double-Entry Ledger Records (PostgreSQL)  │
-│  └─ 5. Issue ACK / NACK to Pub/Sub                     │
-└────────────────────────────────────────────────────────┘
-Key Engineering Problems Solved
-1. Concurrency Control & Deadlock Elimination
-        The Problem: In high-throughput payment systems, concurrent transactions involving overlapping accounts (e.g., Alice sends to Bob while Bob simultaneously sends to Alice) cause circular lock waits in PostgreSQL, triggering deadlocks.
+```
 
-        The Solution: Implemented deterministic, alphabetical row-level locking via SQLAlchemy (SELECT ... FOR UPDATE). By sorting account UUIDs lexicographically before querying the database, transactions acquire locks in an identical global order, eliminating circular wait conditions mathematically.
+---
 
-2. Distributed Idempotency
-        The Problem: Network timeouts or aggressive client retries can lead to duplicate payments.
+## Key Engineering Problems Solved
 
-        The Solution: Integrated Redis-backed idempotency guards at the API boundary. Requests carrying a previously processed idempotency_key are rejected with 409 CONFLICT before any database or messaging resources are consumed.
+### 1. Concurrency Control & Deadlock Prevention
 
-3. Decoupled Ingestion & Backpressure Resilience
-        The Problem: Direct database writes in the HTTP request path introduce latency bottlenecks and risk dropping payments during database failovers or traffic spikes.
+**The problem:** two transactions touching the same two accounts in opposite order (A pays B while B pays A, concurrently) can each lock one account and then block waiting for the other — a circular wait Postgres reports as `deadlock detected`.
 
-        The Solution: The API acts strictly as an event producer, pushing validated payment payloads to a GCP Pub/Sub message broker and returning 202 ACCEPTED. Financial settlement occurs asynchronously via dedicated background workers.
+**The solution:** the row-locking query (`SELECT ... FOR UPDATE`) is given an explicit `ORDER BY id`. Postgres acquires `FOR UPDATE` locks in the order rows are returned, so an `ORDER BY` on a stable column guarantees every transaction touching these two accounts locks them in the same sequence, regardless of which account is paying and which is receiving. That removes the circular wait structurally.
 
-4. Resilient Worker Processing (ACK/NACK Pattern)
-        The Problem: Worker crashes or intermittent database disconnects can cause silent data loss or poison-pill infinite loops.
+*(Note: sorting the account IDs in Python before the query does **not** achieve this — `WHERE id IN (...)` does not preserve or use the order of the list. The ordering has to happen in the SQL query itself, via `ORDER BY`, since that's what actually controls the order Postgres locks the returned rows in.)*
 
-        The Solution:
+Verified with a threaded test (`api/app/test_deadlock.py`) that deterministically forces both scenarios: two connections locking the same two rows in opposite order (confirmed deadlock, SQLSTATE `40P01`), and in the same order (confirmed clean serialization, no deadlock).
 
-                System Errors (Database downtime, lock timeout): The worker issues a NACK (Negative Acknowledgment), leaving the message in Pub/Sub for automated exponential-backoff retry.
+### 2. Idempotency Under At-Least-Once Delivery
 
-                Business Rule Failures (Insufficient funds, missing account): The worker records the business failure and issues an ACK to cleanly remove the poison pill from the queue.
+**The problem:** Pub/Sub guarantees *at-least-once* delivery, not exactly-once — the same message can be redelivered to the worker (e.g. a lost ack, or the worker taking too long to acknowledge). Without protection, a redelivered payment message would move money a second time.
 
-5. Strict Double-Entry Bookkeeping
-        The Problem: Single-column balance increments (balance = balance - amount) leave no audit trail and risk balance drift.
+**The solution — two layers:**
+- **API boundary (Redis):** a fast idempotency-key check on `/charge` rejects an immediate duplicate client request with `409 Conflict`, before any Pub/Sub or database resources are touched.
+- **Worker / database boundary:** the worker itself checks for an existing `Transaction` with the same `idempotency_key` before processing, and the column also carries a database-level `UNIQUE` constraint as a backstop for the case where two concurrent workers pass that check at nearly the same instant. Either path resolves to the same outcome — the message is acknowledged (removed from the queue) without settling the payment a second time.
 
-        The Solution: Every financial event creates an immutable Transaction record linked to two equal and opposite LedgerEntry records (one DEBIT, one CREDIT). Account balances are strictly derived from these ledger movements within an atomic database transaction.
+Verified in `api/app/test_idempotency.py`: sends the same payment twice, asserts the second call is rejected as a duplicate, and confirms the account balances only moved once.
 
-Tech Stack
-        Language: Python 3.11+
+*(Known limitation: the Redis check at the API boundary is a check-then-set, not atomic — two near-simultaneous requests with the same key could both pass it. The worker/database layer is what actually guarantees correctness in that case; the Redis check is a fast-path optimization, not the source of truth.)*
 
-        API Framework: FastAPI, Uvicorn, Pydantic
+### 3. Decoupled Ingestion
 
-        Persistence: PostgreSQL 15, SQLAlchemy, Alembic
+The API never writes to the database directly in the request path — it validates, publishes to Pub/Sub, and returns `202 Accepted`. Settlement happens asynchronously in the worker. This keeps the API responsive even if the database is briefly slow, at the cost of the client not knowing the payment's final outcome at request time (see Known Limitations — there is currently no endpoint to check a transaction's status after the fact).
 
-        In-Memory Cache: Redis 7 (Alpine)
+### 4. Transaction ID Consistency
 
-        Message Broker: Google Cloud Pub/Sub (Local Emulator)
+**The problem:** the API generates a `transaction_id` and returns it to the client immediately (before the worker has processed anything). That same ID needs to end up as the actual primary key of the row the worker eventually creates — otherwise the client is left holding a tracking number that never exists in the database.
 
-        Containerization: Docker, Docker Compose
+**The solution:** the Pub/Sub message is built from a `PaymentTask` schema (client-facing `PaymentRequest` plus the generated `transaction_id`), and the worker explicitly passes that ID through as the database row's `id` rather than letting SQLAlchemy generate a new one by default.
 
-Getting Started
-        Prerequisites
-                Docker Desktop (macOS, Windows, or Linux)
+Verified by asserting, in `test_idempotency.py`, that the ID returned from `execute_payment()` is exactly equal to the ID generated before the call — not just "no error was raised."
 
-                git and curl
+### 5. Worker ACK/NACK Handling
 
-1. Clone the Repository
-        #Bash
-        git clone [https://github.com/YOUR_USERNAME/fintech-ledger-system.git](https://github.com/YOUR_USERNAME/fintech-ledger-system.git)
-        cd fintech-ledger-system
-2. Boot the Infrastructure
-        Run the following command to spin up the API, Worker, PostgreSQL, Redis, Pub/Sub Emulator, and the initialization script:
-                #Bash
-                docker compose up --build -d
-        Verify that all services are running:
-                #Bash
-                docker compose ps
-3. Run Database Migrations
-        Apply Alembic migrations inside the API container to construct the schema:
-        #Bash
-        docker compose exec api alembic upgrade head
-4. Seed Test Accounts
-        Create two baseline accounts (Alice with 10,000 cents / $100.00, Bob with 0 cents):
-        #Bash
-        docker compose exec db psql -U postgres -d ledger_db -c "
-        INSERT INTO accounts (id, name, type, balance) 
-        VALUES 
-        ('11111111-1111-1111-1111-111111111111', 'Alice', 'USER', 10000), 
-        ('22222222-2222-2222-2222-222222222222', 'Bob Coffee', 'MERCHANT', 0);
-        "
-Testing the Pipeline
-1. Submit a Payment
-        Dispatch an asynchronous payment request to the API:
-                #Bash
-                curl -X POST "http://localhost:8000/charge" \
-                -H "Content-Type: application/json" \
-                -d '{
-                        "idempotency_key": "txn_live_test_001",
-                        "user_account_id": "11111111-1111-1111-1111-111111111111",
-                        "merchant_account_id": "22222222-2222-2222-2222-222222222222",
-                        "amount_cents": 1500,
-                        "description": "Espresso and Croissant"
-                        }'
-        Expected Response (202 Accepted):
+- **Duplicate delivery:** ACK — already settled, don't reprocess (see #2).
+- **Business rule failure** (e.g. insufficient funds): ACK — this is a legitimate rejection, retrying it would never succeed.
+- **Unexpected/system error** (DB connection issue, etc.): NACK — Pub/Sub will redeliver later.
 
-        #JSON
-                {
-                "transaction_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
-                "status": "QUEUED",
-                "message": "Payment accepted for background processing."
-                }
-2. Observe Background Settlement
-Check the worker container logs to verify message ingestion and ledger updates:
+*(Known limitation: a business rule rejection is currently only logged, not written to the database as a `FAILED` transaction record — so there's no queryable audit trail of rejected payments yet. On the roadmap.)*
 
-        #Bash
-                docker compose logs worker --tail 20
+### 6. Double-Entry Bookkeeping
 
-Expected Output:
+Every payment creates a `Transaction` linked to `LedgerLine` rows recording the debit and credit sides. `Account.balance` is a stored column, updated alongside the ledger rows in the same atomic transaction — it is not currently derived by summing the ledger at read time. A reconciliation check (verifying stored balance matches the sum of ledger movements) is on the roadmap but not yet implemented.
 
-        Plaintext
-        [WORKER] Received Ticket: 1
-        [WORKER] Processing Payment for 1500 cents...
-        [WORKER] SUCCESS! Ledger updated. Transaction DB ID: 9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d
-3. Verify Account Balances
-Inspect the database to ensure Alice was debited and Bob was credited:
+---
 
-        #Bash
-                docker compose exec db psql -U postgres -d ledger_db -c "SELECT id, name, balance FROM accounts;"
-☁️ Production Cloud Architecture (GCP Reference)
-In an enterprise Google Cloud environment, this architecture scales serverlessly with zero code modification:
+## Tech Stack
 
-API: Google Cloud Run (Public HTTP Service, auto-scales based on incoming web traffic).
+- **Language:** Python 3.11+
+- **API Framework:** FastAPI, Uvicorn, Pydantic
+- **Persistence:** PostgreSQL 15, SQLAlchemy, Alembic
+- **Cache:** Redis 7 (Alpine)
+- **Message Broker:** Google Cloud Pub/Sub (local emulator for development)
+- **Containerization:** Docker, Docker Compose
 
-Broker: Google Cloud Pub/Sub (Globally distributed, persistent message log).
+---
 
-Worker: Google Cloud Run (Private Push-Subscription target, scales to zero when no transactions are pending).
+## Getting Started
 
-Storage: Cloud SQL for PostgreSQL (Multi-AZ High Availability, automated point-in-time recovery).
+### Prerequisites
+- Docker Desktop (macOS, Windows, or Linux)
+- `git` and `curl`
 
-Cache: Cloud Memorystore for Redis (In-memory cluster with VPC peering).
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/YOUR_USERNAME/fintech-ledger-system.git
+cd fintech-ledger-system
+```
+
+### 2. Boot the infrastructure
+
+Spins up the API, worker, PostgreSQL, Redis, and the Pub/Sub emulator:
+
+```bash
+docker compose up --build -d
+docker compose ps
+```
+
+### 3. Run database migrations
+
+```bash
+docker compose exec api alembic upgrade head
+```
+
+### 4. Seed test accounts
+
+```bash
+docker compose exec db psql -U postgres -d ledger_db -c "
+INSERT INTO accounts (id, name, type, balance)
+VALUES
+('11111111-1111-1111-1111-111111111111', 'Alice', 'USER', 10000),
+('22222222-2222-2222-2222-222222222222', 'Bob Coffee', 'MERCHANT', 0);
+"
+```
+
+---
+
+## Testing the Pipeline
+
+### 1. Submit a payment
+
+```bash
+curl -X POST "http://localhost:8000/charge" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "idempotency_key": "txn_live_test_001",
+        "user_account_id": "11111111-1111-1111-1111-111111111111",
+        "merchant_account_id": "22222222-2222-2222-2222-222222222222",
+        "amount_cents": 1500,
+        "description": "Espresso and Croissant"
+      }'
+```
+
+Expected response (`202 Accepted`):
+
+```json
+{
+  "transaction_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "status": "QUEUED",
+  "message": "Payment accepted for background processing."
+}
+```
+
+### 2. Observe background settlement
+
+```bash
+docker compose logs worker --tail 20
+```
+
+Expected output (the message ID Pub/Sub assigns will differ from this example):
+
+```
+[WORKER] Received Ticket: 2810521427192384
+[WORKER] Processing Payment for 1500 cents...
+[WORKER] SUCCESS! Ledger updated. Transaction DB ID: 9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d
+```
+
+Note that the `Transaction DB ID` here matches the `transaction_id` returned by step 1 — that consistency is exactly what's verified in `api/app/test_idempotency.py`.
+
+### 3. Verify account balances
+
+```bash
+docker compose exec db psql -U postgres -d ledger_db -c "SELECT id, name, balance FROM accounts;"
+```
+
+### 4. Run the verification scripts directly
+
+```bash
+docker compose run --rm api python -m app.test_idempotency
+docker compose run --rm api python -m app.test_deadlock
+```
+
+---
+
+## ☁️ Deploying to GCP (No Paid Services Required)
+
+This runs entirely on free tiers:
+
+| Component | Local (docker compose) | GCP deployment |
+|---|---|---|
+| API | `api` container | Cloud Run (scale-to-zero, generous always-free tier) |
+| Worker | `worker` container | Cloud Run (push subscription target) |
+| Message broker | Pub/Sub emulator | Pub/Sub (10 GB/month free) |
+| Database | `db` container (Postgres) | [Neon](https://neon.tech) or [Supabase](https://supabase.com) free tier — Cloud SQL is not free |
+| Cache | `redis` container | [Upstash](https://upstash.com) free tier — Memorystore is not free |
+| Container registry | — | Artifact Registry (0.5 GB free) |
+
+*(This section describes the intended deployment path; it has not yet been executed end-to-end from this repo — see Known Limitations.)*
+
+---
+
+## Known Limitations / Roadmap
+
+Being upfront about what's not done yet:
+
+- No `GET /transactions/{id}` or `GET /accounts/{id}` — a client currently has no way to check a payment's status after the initial `202` response.
+- No `/health` endpoint.
+- Business-rule rejections (e.g. insufficient funds) are logged but not persisted as `FAILED` transaction records.
+- No authentication on the API.
+- No automated test suite (pytest) yet — verification currently relies on the two manual scripts described above (`test_idempotency.py`, `test_deadlock.py`).
+- No reconciliation check between stored `Account.balance` and the sum of ledger movements.
+- No currency validation — a transfer between accounts with different currencies is not currently rejected.
+- GCP deployment (Cloud Run + Neon + Upstash) is designed but not yet deployed from this repo.
+- No CI pipeline.
+
+This project is a personal, in-progress learning exercise mirroring architecture patterns from professional backend work — not a finished product. Bugs found and fixed so far, with the reasoning behind each, are in the commit history.
