@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 # Reuse our existing database and logic layers!
 from . import crud, schemas
+from .crud import DuplicateTransactionError
 from .database import SessionLocal
 
 PROJECT_ID = os.getenv("PROJECT_ID", "local-project")
