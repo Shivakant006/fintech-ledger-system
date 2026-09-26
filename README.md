@@ -80,13 +80,21 @@ Verified by asserting, in `test_idempotency.py`, that the ID returned from `exec
 
 ### 5. Worker ACK/NACK Handling
 
-- **Duplicate delivery:** ACK — already settled, don't reprocess (see #2).
-- **Business rule failure** (e.g. insufficient funds): ACK — this is a legitimate rejection, retrying it would never succeed.
+- **Duplicate delivery:** ACK — already resolved, don't reprocess (see #2 and #6 below).
+- **Business rule failure** (e.g. insufficient funds): ACK — this is a legitimate rejection, retrying it would never succeed. Now also persisted as a `FAILED` transaction (see #6).
 - **Unexpected/system error** (DB connection issue, etc.): NACK — Pub/Sub will redeliver later.
 
-*(Known limitation: a business rule rejection is currently only logged, not written to the database as a `FAILED` transaction record — so there's no queryable audit trail of rejected payments yet. On the roadmap.)*
+### 6. Failed Payments Are Recorded, Not Silently Dropped
 
-### 6. Double-Entry Bookkeeping
+**The problem:** a business-rule rejection (insufficient funds) used to just log a message and vanish — no row in the database, no audit trail. A rejected payment is a real event a fintech ledger needs to keep.
+
+**The solution:** on a business-rule `ValueError`, the worker's DB layer rolls back the (already-undone) balance mutations, then — as a separate, subsequent unit of work — commits a `Transaction` row with `status=FAILED`, carrying the same `id` the client was already given. `DuplicateTransactionError` was extended to carry the existing record's `status`, so a redelivery of an already-failed payment is correctly reported as a duplicate-of-a-failure, not misreported as "already settled."
+
+*(A subtlety worth naming: this introduces its own small race — two concurrent attempts at the same business-rule failure could both try to commit a `FAILED` row under the same `idempotency_key`. That commit is wrapped in its own nested `try/except IntegrityError`, specifically because a sibling `except` clause on the same `try` block cannot catch an exception raised from inside another `except` block — it has to be handled at the point it can actually occur.)*
+
+Verified in `api/app/test_failed_transaction.py`: a solo insufficient-funds payment leaves a `FAILED` row with the correct id, a redelivery is recognized as a duplicate-of-a-failure, and a forced concurrent race (two threads, same idempotency_key, same failure) is confirmed to resolve cleanly — one `FAILED` row, one correctly-reported duplicate, no crash, no infinite retry.
+
+### 7. Double-Entry Bookkeeping
 
 Every payment creates a `Transaction` linked to `LedgerLine` rows recording the debit and credit sides. `Account.balance` is a stored column, updated alongside the ledger rows in the same atomic transaction — it is not currently derived by summing the ledger at read time. A reconciliation check (verifying stored balance matches the sum of ledger movements) is on the roadmap but not yet implemented.
 
@@ -197,6 +205,7 @@ docker compose exec db psql -U postgres -d ledger_db -c "SELECT id, name, balanc
 ```bash
 docker compose run --rm api python -m app.test_idempotency
 docker compose run --rm api python -m app.test_deadlock
+docker compose run --rm api python -m app.test_failed_transaction
 ```
 
 ---
@@ -224,9 +233,8 @@ Being upfront about what's not done yet:
 
 - No `GET /transactions/{id}` or `GET /accounts/{id}` — a client currently has no way to check a payment's status after the initial `202` response.
 - No `/health` endpoint.
-- Business-rule rejections (e.g. insufficient funds) are logged but not persisted as `FAILED` transaction records.
 - No authentication on the API.
-- No automated test suite (pytest) yet — verification currently relies on the two manual scripts described above (`test_idempotency.py`, `test_deadlock.py`).
+- No automated test suite (pytest) yet — verification currently relies on the manual scripts described above (`test_idempotency.py`, `test_deadlock.py`, `test_failed_transaction.py`).
 - No reconciliation check between stored `Account.balance` and the sum of ledger movements.
 - No currency validation — a transfer between accounts with different currencies is not currently rejected.
 - GCP deployment (Cloud Run + Neon + Upstash) is designed but not yet deployed from this repo.
