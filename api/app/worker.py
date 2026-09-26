@@ -5,7 +5,7 @@ from google.cloud import pubsub_v1
 from pydantic import ValidationError
 
 # Reuse our existing database and logic layers!
-from . import crud, schemas
+from . import crud, schemas, models
 from .crud import DuplicateTransactionError
 from .database import SessionLocal
 
@@ -40,12 +40,20 @@ def process_message(message: pubsub_v1.subscriber.message.Message):
             message.ack()
             
         except DuplicateTransactionError as e:
-            # This exact payment was already settled — either an earlier
-            # attempt succeeded and this is a Pub/Sub redelivery, or a
-            # concurrent worker won the race. Either way, this is not a
-            # new payment and not a failure: ack it so it's removed from
-            # the queue, and do NOT touch account balances again.
-            print(f"[WORKER] DUPLICATE (already settled): {e}")
+            # This exact idempotency_key was already resolved once —
+            # either COMPLETED (a prior success, or a concurrent worker won
+            # a race) or FAILED (a prior business-rule rejection). Either
+            # way we don't touch account balances again — replaying an
+            # idempotency key never re-runs the business logic, it reports
+            # what already happened. We DO still distinguish the two in
+            # the log, since "already settled" would be misleading for a
+            # duplicate of a FAILED payment.
+            if e.status == models.TransactionStatus.FAILED:
+                print(f"[WORKER] DUPLICATE of a PREVIOUSLY FAILED payment "
+                      f"(not retried automatically — client would need a "
+                      f"new idempotency_key to retry): {e}")
+            else:
+                print(f"[WORKER] DUPLICATE (already settled): {e}")
             message.ack()
 
         except ValueError as e:

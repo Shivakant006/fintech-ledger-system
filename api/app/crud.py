@@ -5,10 +5,14 @@ from . import models, schemas
 
 class DuplicateTransactionError(Exception):
     """Raised when a transaction with this idempotency_key has already been
-    settled. This is not a failure — it means an earlier attempt (or a
-    redelivered Pub/Sub message for the same attempt) already succeeded.
-    The caller should treat this as a no-op, not a retryable error."""
-    pass
+    resolved — either COMPLETED or FAILED. Either way, this exact request
+    was already handled once; the caller should treat this as a no-op, not
+    retry the business logic. Carries the existing record's status so
+    callers (e.g. the worker's logging) can tell the two cases apart
+    instead of assuming "already settled" for every duplicate."""
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
 
 
 def execute_payment(db: Session, payment_data: schemas.PaymentTask) -> models.Transaction:
@@ -17,9 +21,12 @@ def execute_payment(db: Session, payment_data: schemas.PaymentTask) -> models.Tr
         # -------------------------------------------------------------------
         # 0. IDEMPOTENCY CHECK (proactive path)
         # Pub/Sub is at-least-once delivery: the same message can reach us
-        # more than once. If we've already settled this idempotency_key,
-        # this is a redelivery, not a new payment. Handle it here, before
-        # we touch any account rows.
+        # more than once. If we've already resolved this idempotency_key —
+        # whether it succeeded OR failed a business rule — this is a
+        # redelivery, not a new attempt. Handle it here, before we touch
+        # any account rows. (Replaying an idempotency key never re-runs
+        # the business logic, the same way Stripe's idempotency keys work:
+        # a genuinely new attempt should use a NEW key.)
         # -------------------------------------------------------------------
         existing = db.query(models.Transaction).filter_by(
             idempotency_key=payment_data.idempotency_key
@@ -27,7 +34,8 @@ def execute_payment(db: Session, payment_data: schemas.PaymentTask) -> models.Tr
         if existing:
             raise DuplicateTransactionError(
                 f"Transaction with idempotency_key={payment_data.idempotency_key} "
-                f"already exists (id={existing.id})."
+                f"already exists (id={existing.id}, status={existing.status.value}).",
+                status=existing.status,
             )
 
         # -------------------------------------------------------------------
@@ -135,17 +143,80 @@ def execute_payment(db: Session, payment_data: schemas.PaymentTask) -> models.Tr
         # the loser lands here. We treat it the same as a normal duplicate.
         db.rollback()
         if "idempotency_key" in str(e.orig):
+            # Look up the row the OTHER transaction just committed, so we
+            # can report its actual status rather than guessing.
+            winner = db.query(models.Transaction).filter_by(
+                idempotency_key=payment_data.idempotency_key
+            ).first()
             raise DuplicateTransactionError(
                 f"Transaction with idempotency_key={payment_data.idempotency_key} "
-                f"was inserted concurrently by another worker."
+                f"was inserted concurrently by another worker "
+                f"(status={winner.status.value if winner else 'unknown'}).",
+                status=winner.status if winner else None,
             ) from e
         # Some other constraint was violated (not the one we expect) —
         # don't misreport it as a duplicate, let it surface as-is.
         raise
 
+    except ValueError as e:
+        # BUSINESS RULE FAILURE (insufficient funds, missing account, etc.)
+        # We must NOT let this vanish silently. Two things need to happen,
+        # and they need OPPOSITE treatment from the same session:
+        #   1. The balance mutations we made earlier in this function must
+        #      be undone — db.rollback() does that.
+        #   2. A FAILED Transaction record must be KEPT, as the audit trail
+        #      for the rejection.
+        # rollback() is all-or-nothing for whatever is pending in the
+        # session at the moment it runs — it can't selectively keep one
+        # change and discard another. So we don't try to save the FAILED
+        # row in the same breath as the mutations we're discarding. We
+        # roll back FIRST (cleaning the session completely), and only
+        # THEN, as a fresh, independent unit of work, create and commit
+        # the failure record. By the time we add() it, rollback() has
+        # already finished — there's nothing left for it to undo.
+        db.rollback()
+
+        failed_txn = models.Transaction(
+            id=payment_data.transaction_id,
+            idempotency_key=payment_data.idempotency_key,
+            description=payment_data.description,
+            status=models.TransactionStatus.FAILED,
+        )
+        db.add(failed_txn)
+        try:
+            db.commit()
+        except IntegrityError as commit_err:
+            # Same race we already handle above (see the outer
+            # `except IntegrityError`), but happening on OUR OWN write
+            # this time — another worker, processing the same
+            # idempotency_key concurrently, committed its own
+            # Transaction row (FAILED or COMPLETED) a moment before we
+            # did. Our sibling `except IntegrityError` clause above
+            # cannot catch this: Python does not let one except block
+            # hand off to another except block on the same try — this
+            # error happened INSIDE except ValueError, so it needs its
+            # own handling, right here.
+            db.rollback()
+            winner = db.query(models.Transaction).filter_by(
+                idempotency_key=payment_data.idempotency_key
+            ).first()
+            raise DuplicateTransactionError(
+                f"Transaction with idempotency_key={payment_data.idempotency_key} "
+                f"was already resolved concurrently by another worker "
+                f"(status={winner.status.value if winner else 'unknown'}) "
+                f"while we were recording our own failure.",
+                status=winner.status if winner else None,
+            ) from commit_err
+
+        raise
+
     except Exception as e:
-        # IF ANYTHING ELSE FAILS (e.g., our ValueError for business rules,
-        # a DB connection drop, a lock timeout), ROLLBACK the entire
-        # transaction. Undo balance changes. Release the locks.
+        # IF ANYTHING ELSE FAILS (e.g., a DB connection drop, a lock
+        # timeout), ROLLBACK the entire transaction. Undo balance changes.
+        # Release the locks. This is a SYSTEM error, not a business
+        # rejection — we do NOT write a FAILED record here, because we
+        # don't actually know the payment was rejected; it may not have
+        # been attempted at all, and the worker will NACK this so Pub/Sub
+        # retries it later. Writing FAILED here would be a lie.
         db.rollback()
         raise e
