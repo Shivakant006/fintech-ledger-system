@@ -59,12 +59,10 @@ Verified with a threaded test (`api/app/test_deadlock.py`) that deterministicall
 **The problem:** Pub/Sub guarantees *at-least-once* delivery, not exactly-once — the same message can be redelivered to the worker (e.g. a lost ack, or the worker taking too long to acknowledge). Without protection, a redelivered payment message would move money a second time.
 
 **The solution — two layers:**
-- **API boundary (Redis):** a fast idempotency-key check on `/charge` rejects an immediate duplicate client request with `409 Conflict`, before any Pub/Sub or database resources are touched.
+- **API boundary (Redis):** an atomic `SET ... NX EX 86400` on `/charge` claims the idempotency key in one indivisible Redis operation — not a separate check-then-set — so two genuinely concurrent requests with the same key can never both pass. The loser is rejected with `409 Conflict` immediately, before a `transaction_id` is even generated or Pub/Sub is touched, so no client is ever left holding a tracking number that will never exist in the database. If the subsequent Pub/Sub publish fails, the claimed key is explicitly released (`cache.delete`) before the error is returned — otherwise a legitimate retry with the same idempotency_key would be wrongly rejected for the next 24 hours.
 - **Worker / database boundary:** the worker itself checks for an existing `Transaction` with the same `idempotency_key` before processing, and the column also carries a database-level `UNIQUE` constraint as a backstop for the case where two concurrent workers pass that check at nearly the same instant. Either path resolves to the same outcome — the message is acknowledged (removed from the queue) without settling the payment a second time.
 
-Verified in `api/app/test_idempotency.py`: sends the same payment twice, asserts the second call is rejected as a duplicate, and confirms the account balances only moved once.
-
-*(Known limitation: the Redis check at the API boundary is a check-then-set, not atomic — two near-simultaneous requests with the same key could both pass it. The worker/database layer is what actually guarantees correctness in that case; the Redis check is a fast-path optimization, not the source of truth.)*
+Verified in `api/app/test_idempotency.py` (duplicate Pub/Sub delivery, function-level) and `api/app/test_race_condition.py` (two genuinely concurrent HTTP requests at the real running API, same idempotency_key — confirms exactly one `202`, one `409`, exactly one `Transaction` row, and that the winning client's `transaction_id` matches it exactly).
 
 ### 3. Decoupled Ingestion
 
@@ -208,6 +206,12 @@ docker compose run --rm api python -m app.test_deadlock
 docker compose run --rm api python -m app.test_failed_transaction
 ```
 
+`test_race_condition.py` is different from the three above — it fires real HTTP requests at the live API, so it must run against the already-running container, not a fresh one:
+
+```bash
+docker compose exec api python -m app.test_race_condition
+```
+
 ---
 
 ## ☁️ Deploying to GCP (No Paid Services Required)
@@ -234,7 +238,7 @@ Being upfront about what's not done yet:
 - No `GET /transactions/{id}` or `GET /accounts/{id}` — a client currently has no way to check a payment's status after the initial `202` response.
 - No `/health` endpoint.
 - No authentication on the API.
-- No automated test suite (pytest) yet — verification currently relies on the manual scripts described above (`test_idempotency.py`, `test_deadlock.py`, `test_failed_transaction.py`).
+- No automated test suite (pytest) yet — verification currently relies on the manual scripts described above (`test_idempotency.py`, `test_deadlock.py`, `test_failed_transaction.py`, `test_race_condition.py`).
 - No reconciliation check between stored `Account.balance` and the sum of ledger movements.
 - No currency validation — a transfer between accounts with different currencies is not currently rejected.
 - GCP deployment (Cloud Run + Neon + Upstash) is designed but not yet deployed from this repo.
