@@ -45,6 +45,15 @@ class Transaction(Base):
     description = Column(String(255))
     status = Column(Enum(TransactionStatus), default=TransactionStatus.PENDING)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    # The requested payment amount, in cents. Stored directly on the
+    # Transaction (not just derived from LedgerLine) because a FAILED
+    # transaction has NO LedgerLine rows at all — there was no money
+    # movement to record — but a client still needs to know how much
+    # they attempted to send. nullable=False because every code path
+    # that creates a Transaction (success or failure) already has this
+    # value in scope from the original PaymentTask; there's no
+    # legitimate case where it would be unknown.
+    amount_cents = Column(BigInteger, nullable=False)
 
     # This allows us to easily fetch all lines associated with this transaction via Python
     lines = relationship("LedgerLine", back_populates="transaction")

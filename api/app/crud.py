@@ -1,6 +1,18 @@
+from uuid import UUID
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from . import models, schemas
+
+
+def get_transaction(db: Session, transaction_id: UUID) -> models.Transaction | None:
+    """
+    Simple read: look up a single Transaction by id. No locking, no
+    business logic — a status check is not a money-moving operation, so
+    none of the concurrency protections execute_payment() needs apply
+    here. Returns None if no matching row exists; the caller (the API
+    endpoint) decides what that means (a 404).
+    """
+    return db.query(models.Transaction).filter(models.Transaction.id == transaction_id).first()
 
 
 class DuplicateTransactionError(Exception):
