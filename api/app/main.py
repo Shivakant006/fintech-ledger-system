@@ -1,12 +1,14 @@
 from fastapi import FastAPI, Depends, HTTPException, status
+from sqlalchemy.orm import Session
 import redis
 import json
 import os
 import uuid
 from google.cloud import pubsub_v1
 
-from . import schemas
+from . import schemas, crud
 from .redis_client import get_redis
+from .database import get_db
 
 app = FastAPI(title="FinTech Ledger API (Decoupled)")
 
@@ -99,3 +101,26 @@ def process_payment(
         # error back to the client, so their retry is free to succeed.
         cache.delete(lock_key)
         raise HTTPException(status_code=500, detail="Failed to queue payment.")
+
+
+@app.get("/transactions/{transaction_id}", response_model=schemas.TransactionStatusResponse)
+def get_transaction_status(transaction_id: uuid.UUID, db: Session = Depends(get_db)):
+    # Read-only status check — no locking, no Redis, no Pub/Sub. A client
+    # polls this after their /charge call to find out what actually
+    # happened to their payment (it may still be PENDING if the worker
+    # hasn't processed the message yet).
+    txn = crud.get_transaction(db, transaction_id)
+
+    if txn is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No transaction found with id={transaction_id}.",
+        )
+
+    return schemas.TransactionStatusResponse(
+        transaction_id=txn.id,
+        status=txn.status.value,
+        amount_cents=txn.amount_cents,
+        description=txn.description,
+        created_at=txn.created_at,
+    )

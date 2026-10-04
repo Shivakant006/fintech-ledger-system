@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field, UUID4
 from typing import Optional
 from uuid import UUID
+import datetime
 
 class PaymentRequest(BaseModel):
     # The client must provide a unique key for this specific action
@@ -32,3 +33,21 @@ class PaymentResponse(BaseModel):
     transaction_id: UUID
     status: str
     message: str
+
+class TransactionStatusResponse(BaseModel):
+    """
+    Response shape for GET /transactions/{transaction_id}. Deliberately
+    does NOT include LedgerLine detail (account ids, individual debit/
+    credit rows) — that's internal bookkeeping. A client checking on
+    their payment needs to know: did it go through, and for how much.
+    """
+    transaction_id: UUID
+    status: str
+    amount_cents: int
+    description: Optional[str]
+    created_at: datetime.datetime
+    # Built explicitly in the endpoint, not via from_attributes/ORM mode:
+    # the Transaction model's primary key is .id (not .transaction_id),
+    # and .status is a TransactionStatus ENUM object, not a plain string
+    # — an automatic attribute-name mapping would silently mismatch the
+    # first and hand back the wrong type for the second.

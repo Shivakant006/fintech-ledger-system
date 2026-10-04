@@ -109,7 +109,8 @@ def execute_payment(db: Session, payment_data: schemas.PaymentTask) -> models.Tr
             id=payment_data.transaction_id,
             idempotency_key=payment_data.idempotency_key,
             description=payment_data.description,
-            status=models.TransactionStatus.COMPLETED
+            status=models.TransactionStatus.COMPLETED,
+            amount_cents=payment_data.amount_cents,
         )
         db.add(new_txn)
         
@@ -193,6 +194,7 @@ def execute_payment(db: Session, payment_data: schemas.PaymentTask) -> models.Tr
             idempotency_key=payment_data.idempotency_key,
             description=payment_data.description,
             status=models.TransactionStatus.FAILED,
+            amount_cents=payment_data.amount_cents,
         )
         db.add(failed_txn)
         try:

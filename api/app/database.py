@@ -22,3 +22,17 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # All our models will inherit from this Base class.
 Base = declarative_base()
+
+
+def get_db():
+    """
+    FastAPI dependency: opens one SessionLocal() per request, hands it to
+    the endpoint via Depends(get_db), and guarantees it's closed afterward
+    — success or failure — via the try/finally. This is the standard
+    FastAPI pattern for request-scoped database access.
+    """
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
