@@ -5,12 +5,16 @@ from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 from alembic import context
 
-# 1. Add the root project directory to the Python path so it can find the 'api' folder
+# 1. Add the api/ directory to the Python path so it can find the 'app' package.
+# (alembic/ now lives INSIDE api/, alongside app/, matching how the running
+# api container actually sees its own code: as package "app", not "api.app" —
+# this used to assume alembic ran from the repo root, which never matched
+# how the container itself imports its own modules.)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # 2. Import our actual database URL and Models
-from api.app.database import SQLALCHEMY_DATABASE_URL
-from api.app.models import Base
+from app.database import SQLALCHEMY_DATABASE_URL
+from app.models import Base
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
