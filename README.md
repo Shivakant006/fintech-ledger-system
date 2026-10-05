@@ -40,6 +40,8 @@ The system decouples transaction ingestion from financial settlement: the API va
 └────────────────────────────────────────────────────────┘
 ```
 
+A client can poll `GET /transactions/{id}` at any point after the initial `202` to check what actually happened — see section 8 below.
+
 ---
 
 ## Key Engineering Problems Solved
@@ -66,7 +68,7 @@ Verified in `api/app/test_idempotency.py` (duplicate Pub/Sub delivery, function-
 
 ### 3. Decoupled Ingestion
 
-The API never writes to the database directly in the request path — it validates, publishes to Pub/Sub, and returns `202 Accepted`. Settlement happens asynchronously in the worker. This keeps the API responsive even if the database is briefly slow, at the cost of the client not knowing the payment's final outcome at request time (see Known Limitations — there is currently no endpoint to check a transaction's status after the fact).
+The API never writes to the database directly in the request path — it validates, publishes to Pub/Sub, and returns `202 Accepted`. Settlement happens asynchronously in the worker. This keeps the API responsive even if the database is briefly slow, at the cost of the client not knowing the payment's final outcome at the moment of the request — `GET /transactions/{id}` (section 8) closes that gap by letting the client check afterward.
 
 ### 4. Transaction ID Consistency
 
@@ -95,6 +97,23 @@ Verified in `api/app/test_failed_transaction.py`: a solo insufficient-funds paym
 ### 7. Double-Entry Bookkeeping
 
 Every payment creates a `Transaction` linked to `LedgerLine` rows recording the debit and credit sides. `Account.balance` is a stored column, updated alongside the ledger rows in the same atomic transaction — it is not currently derived by summing the ledger at read time. A reconciliation check (verifying stored balance matches the sum of ledger movements) is on the roadmap but not yet implemented.
+
+### 8. Checking Transaction Status (`GET /transactions/{id}`)
+
+**The problem:** since the API responds before settlement happens (#3 above), a client had no way to ever find out what actually happened to their payment after the initial `202`.
+
+**The solution:** a read-only `GET /transactions/{id}` endpoint. Deliberately returns only `transaction_id`, `status`, `amount_cents`, `description`, and `created_at` — not the underlying `LedgerLine` entries (account IDs, individual debit/credit rows), which are treated as internal bookkeeping. This required adding an `amount_cents` column directly on `Transaction` itself: the amount previously only existed on `LedgerLine`, but a `FAILED` transaction has **no** ledger lines at all (no money moved, nothing to record), so there was no way to answer "how much did they try to send" for a failed payment without storing it on `Transaction` directly. The column is `nullable=False` — every code path that creates a `Transaction`, success or failure, already has this value in scope.
+
+A request for a transaction ID that doesn't exist returns `404`; a malformed (non-UUID) ID returns `422` automatically via FastAPI's path-parameter type validation — two different failure modes, handled at the layer where each one naturally belongs.
+
+Verified manually end-to-end: `POST /charge` → poll `GET /transactions/{id}` → confirms `status`, `amount_cents`, and `description` match what was submitted; a random nonexistent UUID confirms the `404` path.
+
+### 9. Infrastructure Reliability (Alembic + Postgres persistence)
+
+Two structural bugs were found and fixed while adding the migration for #8 above — both would have blocked *any* contributor, not just this specific change:
+
+- **Alembic was never actually usable.** The `alembic` package was missing from `requirements.txt` entirely (the command didn't exist in the container), and separately, `alembic.ini`/`alembic/` lived at the repo root while `docker-compose.yml` only mounts `./api` into the API container — so even with the package installed, those files were invisible inside it. Both are fixed: the dependency is now declared, and `alembic/` now lives inside `api/`, alongside the app it migrates, with `env.py`'s imports updated to match (`app.*`, not `api.app.*`).
+- **Postgres had no persistent volume.** `docker-compose.yml`'s `db` service stored data inside the container's own temporary writable layer, with nothing mapped to survive container recreation. Any `docker compose down`, rebuild, or Docker Desktop restart silently wiped every table with no warning. Fixed with a named `pgdata` volume — data now survives exactly the operations it should.
 
 ---
 
@@ -136,6 +155,8 @@ docker compose ps
 ```bash
 docker compose exec api alembic upgrade head
 ```
+
+This applies two migrations: the initial schema, then the `amount_cents` column added for the status-check endpoint (section 8). Postgres data now persists in a named volume, so this only needs to be re-run after a genuinely fresh database, not after every `docker compose down`.
 
 ### 4. Seed test accounts
 
@@ -192,13 +213,35 @@ Expected output (the message ID Pub/Sub assigns will differ from this example):
 
 Note that the `Transaction DB ID` here matches the `transaction_id` returned by step 1 — that consistency is exactly what's verified in `api/app/test_idempotency.py`.
 
-### 3. Verify account balances
+### 3. Check the transaction's status
+
+```bash
+curl http://localhost:8000/transactions/9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d
+```
+
+```json
+{
+  "transaction_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "status": "COMPLETED",
+  "amount_cents": 1500,
+  "description": "Espresso and Croissant",
+  "created_at": "2026-10-04T15:41:20.219300"
+}
+```
+
+A nonexistent ID returns `404`:
+
+```bash
+curl -i http://localhost:8000/transactions/00000000-0000-0000-0000-000000000000
+```
+
+### 4. Verify account balances
 
 ```bash
 docker compose exec db psql -U postgres -d ledger_db -c "SELECT id, name, balance FROM accounts;"
 ```
 
-### 4. Run the verification scripts directly
+### 5. Run the verification scripts directly
 
 ```bash
 docker compose run --rm api python -m app.test_idempotency
@@ -235,7 +278,7 @@ This runs entirely on free tiers:
 
 Being upfront about what's not done yet:
 
-- No `GET /transactions/{id}` or `GET /accounts/{id}` — a client currently has no way to check a payment's status after the initial `202` response.
+- No `GET /accounts/{id}`.
 - No `/health` endpoint.
 - No authentication on the API.
 - No automated test suite (pytest) yet — verification currently relies on the manual scripts described above (`test_idempotency.py`, `test_deadlock.py`, `test_failed_transaction.py`, `test_race_condition.py`).
