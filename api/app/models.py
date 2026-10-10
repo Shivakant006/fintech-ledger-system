@@ -25,7 +25,8 @@ class Account(Base):
     name = Column(String(255), nullable=False)
     type = Column(Enum(AccountType), nullable=False)
     # Balances are strictly in CENTS (BigInteger) to prevent float precision errors
-    balance = Column(BigInteger, default=0, nullable=False) 
+    balance = Column(BigInteger, default=0, nullable=False)
+    opening_balance = Column(BigInteger, default=0, nullable=False)
     currency = Column(String(3), default="INR")
 
     # DB-level constraint: A user's balance can never drop below zero.
