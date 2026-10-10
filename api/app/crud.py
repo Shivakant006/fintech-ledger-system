@@ -2,6 +2,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from . import models, schemas
+from sqlalchemy import func
 
 
 def get_transaction(db: Session, transaction_id: UUID) -> models.Transaction | None:
@@ -234,3 +235,38 @@ def execute_payment(db: Session, payment_data: schemas.PaymentTask) -> models.Tr
         # retries it later. Writing FAILED here would be a lie.
         db.rollback()
         raise e
+def reconcile_accounts(db: Session) -> list[dict]:
+    """
+    Returns every account whose stored balance does not match
+    opening_balance + SUM(ledger_lines.amount). An empty list means the
+    ledger is consistent.
+
+    Read-only: no locks, no writes. It runs as one SQL statement, so it sees
+    one consistent snapshot even while payments are being settled.
+    """
+    ledger_sum = func.coalesce(func.sum(models.LedgerLine.amount), 0)
+    expected = models.Account.opening_balance + ledger_sum
+
+    rows = (
+        db.query(
+            models.Account.id,
+            models.Account.name,
+            models.Account.balance,
+            expected.label("expected_balance"),
+        )
+        .outerjoin(models.LedgerLine, models.LedgerLine.account_id == models.Account.id)
+        .group_by(models.Account.id)
+        .having(models.Account.balance != expected)
+        .all()
+    )
+
+    return [
+        {
+            "account_id": r.id,
+            "name": r.name,
+            "stored_balance": r.balance,
+            "expected_balance": int(r.expected_balance),
+            "difference": r.balance - int(r.expected_balance),
+        }
+        for r in rows
+    ]
