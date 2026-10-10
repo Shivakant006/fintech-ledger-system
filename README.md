@@ -96,7 +96,7 @@ Verified in `api/app/test_failed_transaction.py`: a solo insufficient-funds paym
 
 ### 7. Double-Entry Bookkeeping
 
-Every payment creates a `Transaction` linked to `LedgerLine` rows recording the debit and credit sides. `Account.balance` is a stored column, updated alongside the ledger rows in the same atomic transaction — it is not currently derived by summing the ledger at read time. A reconciliation check (verifying stored balance matches the sum of ledger movements) is on the roadmap but not yet implemented.
+`Account.balance` is a stored column, updated alongside the ledger rows in the same atomic transaction. It is not derived by summing the ledger at read time. Instead, `crud.reconcile_accounts()` verifies the invariant `balance == opening_balance + SUM(ledger_lines.amount)` for every account and reports any that disagree. Starting money is recorded in `Account.opening_balance`.
 
 ### 8. Checking Transaction Status (`GET /transactions/{id}`)
 
@@ -162,10 +162,10 @@ This applies two migrations: the initial schema, then the `amount_cents` column 
 
 ```bash
 docker compose exec db psql -U postgres -d ledger_db -c "
-INSERT INTO accounts (id, name, type, balance)
+INSERT INTO accounts (id, name, type, balance, opening_balance)
 VALUES
-('11111111-1111-1111-1111-111111111111', 'Alice', 'USER', 10000),
-('22222222-2222-2222-2222-222222222222', 'Bob Coffee', 'MERCHANT', 0);
+('11111111-1111-1111-1111-111111111111', 'Alice', 'USER', 10000, 10000),
+('22222222-2222-2222-2222-222222222222', 'Bob Coffee', 'MERCHANT', 0, 0);
 "
 ```
 
@@ -282,7 +282,6 @@ Being upfront about what's not done yet:
 - No `/health` endpoint.
 - No authentication on the API.
 - No automated test suite (pytest) yet — verification currently relies on the manual scripts described above (`test_idempotency.py`, `test_deadlock.py`, `test_failed_transaction.py`, `test_race_condition.py`).
-- No reconciliation check between stored `Account.balance` and the sum of ledger movements.
 - No currency validation — a transfer between accounts with different currencies is not currently rejected.
 - GCP deployment (Cloud Run + Neon + Upstash) is designed but not yet deployed from this repo.
 - No CI pipeline.
