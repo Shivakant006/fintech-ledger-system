@@ -36,12 +36,12 @@ def main():
         user = models.Account(
             name=f"Test User {run_id}",
             type=models.AccountType.USER,
-            balance=10_000,  # $100.00, in cents
+            balance=10_000, opening_balance=10_000,  # $100.00, in cents
         )
         merchant = models.Account(
             name=f"Test Merchant {run_id}",
             type=models.AccountType.MERCHANT,
-            balance=0,
+            balance=0, opening_balance=0,
         )
         db.add_all([user, merchant])
         db.commit()

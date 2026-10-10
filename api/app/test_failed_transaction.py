@@ -33,9 +33,9 @@ def _setup_accounts(balance_cents):
     try:
         run_id = uuid.uuid4().hex[:8]
         user = models.Account(name=f"Poor Test User {run_id}",
-                               type=models.AccountType.USER, balance=balance_cents)
+                               type=models.AccountType.USER, balance=balance_cents, opening_balance=balance_cents)
         merchant = models.Account(name=f"Test Merchant {run_id}",
-                                   type=models.AccountType.MERCHANT, balance=0)
+                                   type=models.AccountType.MERCHANT, balance=0, opening_balance=0)
         db.add_all([user, merchant])
         db.commit()
         db.refresh(user)

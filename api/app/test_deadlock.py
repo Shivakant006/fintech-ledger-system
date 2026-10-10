@@ -51,9 +51,9 @@ def _setup_accounts():
     try:
         run_id = uuid.uuid4().hex[:8]
         acc1 = models.Account(name=f"Deadlock Test A {run_id}",
-                               type=models.AccountType.USER, balance=1000)
+                               type=models.AccountType.USER, balance=1000, opening_balance=1000)
         acc2 = models.Account(name=f"Deadlock Test B {run_id}",
-                               type=models.AccountType.USER, balance=1000)
+                               type=models.AccountType.USER, balance=1000, opening_balance=1000)
         db.add_all([acc1, acc2])
         db.commit()
         db.refresh(acc1)
