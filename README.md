@@ -115,6 +115,14 @@ Two structural bugs were found and fixed while adding the migration for #8 above
 - **Alembic was never actually usable.** The `alembic` package was missing from `requirements.txt` entirely (the command didn't exist in the container), and separately, `alembic.ini`/`alembic/` lived at the repo root while `docker-compose.yml` only mounts `./api` into the API container — so even with the package installed, those files were invisible inside it. Both are fixed: the dependency is now declared, and `alembic/` now lives inside `api/`, alongside the app it migrates, with `env.py`'s imports updated to match (`app.*`, not `api.app.*`).
 - **Postgres had no persistent volume.** `docker-compose.yml`'s `db` service stored data inside the container's own temporary writable layer, with nothing mapped to survive container recreation. Any `docker compose down`, rebuild, or Docker Desktop restart silently wiped every table with no warning. Fixed with a named `pgdata` volume — data now survives exactly the operations it should.
 
+### 10. Single-Currency Ledger (INR)
+
+The ledger is single-currency by design. `accounts.currency` is `NOT NULL` with a server default of `'INR'`, and a `CHECK (currency = 'INR')` constraint (`check_currency_inr`) makes Postgres itself reject any other value. No code path, raw SQL insert, or manual update can create a non-INR account, so a transfer between mismatched currencies cannot occur.
+
+This was a deliberate scope decision. Cross-currency transfers would need stored exchange rates, rounding rules, per-currency ledger lines and FX clearing accounts, because a debit of 9000 INR and a credit of 100 USD do not sum to zero. Rather than ship a half-correct version, the ledger enforces one currency and lists multi-currency as future work.
+
+Verified in `api/app/test_currency_validation.py`: a USD account, a NULL currency, and an UPDATE to USD are all rejected by the database; a raw insert that omits currency defaults to INR; and a normal INR payment still settles with reconciliation clean.
+
 ---
 
 ## Tech Stack
@@ -156,7 +164,7 @@ docker compose ps
 docker compose exec api alembic upgrade head
 ```
 
-This applies two migrations: the initial schema, then the `amount_cents` column added for the status-check endpoint (section 8). Postgres data now persists in a named volume, so this only needs to be re-run after a genuinely fresh database, not after every `docker compose down`.
+This applies four migrations: the initial schema, the `amount_cents` column added for the status-check endpoint (section 8), the `opening_balance` column used by the reconciliation check (section 7), and the INR-only currency constraint (section 10). Postgres data now persists in a named volume, so this only needs to be re-run after a genuinely fresh database, not after every `docker compose down`.
 
 ### 4. Seed test accounts
 
@@ -247,6 +255,8 @@ docker compose exec db psql -U postgres -d ledger_db -c "SELECT id, name, balanc
 docker compose run --rm api python -m app.test_idempotency
 docker compose run --rm api python -m app.test_deadlock
 docker compose run --rm api python -m app.test_failed_transaction
+docker compose run --rm api python -m app.test_reconciliation
+docker compose run --rm api python -m app.test_currency_validation
 ```
 
 `test_race_condition.py` is different from the three above — it fires real HTTP requests at the live API, so it must run against the already-running container, not a fresh one:
@@ -282,7 +292,7 @@ Being upfront about what's not done yet:
 - No `/health` endpoint.
 - No authentication on the API.
 - No automated test suite (pytest) yet — verification currently relies on the manual scripts described above (`test_idempotency.py`, `test_deadlock.py`, `test_failed_transaction.py`, `test_race_condition.py`).
-- No currency validation — a transfer between accounts with different currencies is not currently rejected.
+- Single currency only (INR), enforced by a database constraint. Multi-currency support would need stored exchange rates, rounding rules, per-currency ledger lines and FX clearing accounts.
 - GCP deployment (Cloud Run + Neon + Upstash) is designed but not yet deployed from this repo.
 - No CI pipeline.
 
