@@ -123,6 +123,30 @@ This was a deliberate scope decision. Cross-currency transfers would need stored
 
 Verified in `api/app/test_currency_validation.py`: a USD account, a NULL currency, and an UPDATE to USD are all rejected by the database; a raw insert that omits currency defaults to INR; and a normal INR payment still settles with reconciliation clean.
 
+
+### 11. Checking an Account (`GET /accounts/{id}`)
+
+A read-only endpoint that returns an account's current state:
+
+```bash
+curl http://localhost:8000/accounts/11111111-1111-1111-1111-111111111111
+```
+
+```json
+{
+  "account_id": "11111111-1111-1111-1111-111111111111",
+  "name": "Alice",
+  "type": "USER",
+  "balance_cents": 10000,
+  "currency": "INR"
+}
+```
+
+An unknown id returns `404`, and a malformed id returns `422`. The lookup takes no locks, since a read is not a money-moving operation. The balance reflects **settled** payments only: a payment accepted by `/charge` (`202`) is not included until the worker settles it, so a client should poll `GET /transactions/{id}` for the status of a specific payment. `opening_balance` is deliberately not exposed, because it is internal bookkeeping for the reconciliation check.
+
+Verified in `api/app/test_get_account.py`: the response has exactly the documented fields, balances update after a payment settles, an unknown id returns `404`, and a malformed id returns `422`.
+
+
 ---
 
 ## Tech Stack
@@ -247,6 +271,11 @@ curl -i http://localhost:8000/transactions/00000000-0000-0000-0000-000000000000
 
 ```bash
 docker compose exec db psql -U postgres -d ledger_db -c "SELECT id, name, balance FROM accounts;"
+
+Or through the API:
+
+curl http://localhost:8000/accounts/<account-id>
+
 ```
 
 ### 5. Run the verification scripts directly
@@ -259,10 +288,11 @@ docker compose run --rm api python -m app.test_reconciliation
 docker compose run --rm api python -m app.test_currency_validation
 ```
 
-`test_race_condition.py` is different from the three above — it fires real HTTP requests at the live API, so it must run against the already-running container, not a fresh one:
+`test_race_condition.py` and `test_get_account.py` are different from the three above — they fire real HTTP requests at the live API, so they must run against the already-running container, not a fresh one:
 
 ```bash
 docker compose exec api python -m app.test_race_condition
+docker compose exec api python -m app.test_get_account
 ```
 
 ---
@@ -288,10 +318,9 @@ This runs entirely on free tiers:
 
 Being upfront about what's not done yet:
 
-- No `GET /accounts/{id}`.
 - No `/health` endpoint.
 - No authentication on the API.
-- No automated test suite (pytest) yet — verification currently relies on the manual scripts described above (`test_idempotency.py`, `test_deadlock.py`, `test_failed_transaction.py`, `test_race_condition.py`).
+- No automated test suite (pytest) yet — verification currently relies on the manual scripts described above (`test_idempotency.py`, `test_deadlock.py`, `test_failed_transaction.py`, `test_race_condition.py`,`test_get_account.py`).
 - Single currency only (INR), enforced by a database constraint. Multi-currency support would need stored exchange rates, rounding rules, per-currency ledger lines and FX clearing accounts.
 - GCP deployment (Cloud Run + Neon + Upstash) is designed but not yet deployed from this repo.
 - No CI pipeline.
