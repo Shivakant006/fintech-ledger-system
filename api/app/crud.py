@@ -15,6 +15,18 @@ def get_transaction(db: Session, transaction_id: UUID) -> models.Transaction | N
     """
     return db.query(models.Transaction).filter(models.Transaction.id == transaction_id).first()
 
+def get_account(db: Session, account_id: UUID) -> models.Account | None:
+    """
+    Simple read: look up a single Account by id. No locking, because a
+    balance lookup is not a money-moving operation. Returns None if no
+    matching row exists; the caller (the API endpoint) decides what that
+    means (a 404).
+
+    Note the balance returned here reflects SETTLED payments only. A payment
+    the API has accepted (202) but the worker hasn't processed yet is not in
+    this number until settlement completes.
+    """
+    return db.query(models.Account).filter(models.Account.id == account_id).first()
 
 class DuplicateTransactionError(Exception):
     """Raised when a transaction with this idempotency_key has already been

@@ -124,3 +124,25 @@ def get_transaction_status(transaction_id: uuid.UUID, db: Session = Depends(get_
         description=txn.description,
         created_at=txn.created_at,
     )
+
+
+@app.get("/accounts/{account_id}", response_model=schemas.AccountResponse)
+def get_account_details(account_id: uuid.UUID, db: Session = Depends(get_db)):
+    # Read-only lookup: no locking, no Redis, no Pub/Sub. The balance shown
+    # reflects SETTLED payments only; a payment accepted by /charge but not
+    # yet processed by the worker is not included until it settles.
+    account = crud.get_account(db, account_id)
+
+    if account is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No account found with id={account_id}.",
+        )
+
+    return schemas.AccountResponse(
+        account_id=account.id,
+        name=account.name,
+        type=account.type.value,
+        balance_cents=account.balance,
+        currency=account.currency,
+    )

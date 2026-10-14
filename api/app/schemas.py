@@ -51,3 +51,19 @@ class TransactionStatusResponse(BaseModel):
     # and .status is a TransactionStatus ENUM object, not a plain string
     # — an automatic attribute-name mapping would silently mismatch the
     # first and hand back the wrong type for the second.
+
+
+class AccountResponse(BaseModel):
+    """
+    Response shape for GET /accounts/{account_id}. Deliberately does NOT
+    include opening_balance: that is internal bookkeeping used by the
+    reconciliation check, not something a client needs.
+    Built explicitly in the endpoint: Account's primary key is .id (not
+    .account_id), .type is an AccountType ENUM object, and balance is
+    exposed as balance_cents so the unit is unambiguous.
+    """
+    account_id: UUID
+    name: str
+    type: str
+    balance_cents: int
+    currency: str
