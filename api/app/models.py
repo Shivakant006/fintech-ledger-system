@@ -27,7 +27,7 @@ class Account(Base):
     # Balances are strictly in CENTS (BigInteger) to prevent float precision errors
     balance = Column(BigInteger, default=0, nullable=False)
     opening_balance = Column(BigInteger, default=0, nullable=False)
-    currency = Column(String(3), default="INR")
+    currency = Column(String(3), nullable=False, default="INR", server_default="INR")
 
     # DB-level constraint: A user's balance can never drop below zero.
     __table_args__ = (
@@ -35,6 +35,7 @@ class Account(Base):
             "(type = 'USER' AND balance >= 0) OR type != 'USER'",
             name="check_positive_user_balance"
         ),
+        CheckConstraint("currency = 'INR'", name="check_currency_inr"),
     )
 
 class Transaction(Base):
