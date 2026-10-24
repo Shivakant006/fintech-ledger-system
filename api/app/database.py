@@ -15,6 +15,7 @@ engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
     pool_size=20,          # Keep 20 connections open and ready
     max_overflow=10,       # Allow 10 extra connections during traffic spikes
+    connect_args={"connect_timeout": 3},  # Fail fast if the DB is unreachable
 )
 
 # SessionLocal is a factory that gives us a database session for each API request.
