@@ -146,6 +146,27 @@ An unknown id returns `404`, and a malformed id returns `422`. The lookup takes 
 
 Verified in `api/app/test_get_account.py`: the response has exactly the documented fields, balances update after a payment settles, an unknown id returns `404`, and a malformed id returns `422`.
 
+### 12. Health Checks (`/health` and `/health/ready`)
+
+Two endpoints, deliberately separate:
+
+| Endpoint | Question it answers | Checks | Response |
+|---|---|---|---|
+| `GET /health` | Is the process running? (liveness) | Nothing external | Always `200 {"status": "ok"}` |
+| `GET /health/ready` | Can it serve requests right now? (readiness) | Postgres (`SELECT 1`) and Redis (`PING`) | `200` if both respond, `503` otherwise |
+
+Example readiness response while Redis is down:
+
+```json
+{"status":"unavailable","checks":{"database":"ok","redis":"error: ConnectionError"}}
+```
+
+Liveness is kept free of dependency checks on purpose: if it depended on Postgres or Redis, an outage in either would make every healthy API container look dead, and an orchestrator would restart them all without fixing anything. Readiness checks each dependency independently and reports only the exception type, never its message, since driver errors can contain hostnames or connection details. The Redis check uses its own short-lived client with a 1-second timeout, and the database engine has a 3-second connect timeout, so a slow dependency can't stall a probe indefinitely.
+
+Not covered: Pub/Sub (the publisher client has no cheap ping, and a failed publish already returns a clean `500` from `/charge`) and the worker, which has no HTTP server.
+
+Verified in `api/app/test_health.py` and by hand: with Redis stopped, `/health` stayed `200` while `/health/ready` returned `503` naming Redis with the database still `ok`, and after restarting Redis it returned `200` again without restarting the API.
+
 
 ---
 
@@ -288,11 +309,12 @@ docker compose run --rm api python -m app.test_reconciliation
 docker compose run --rm api python -m app.test_currency_validation
 ```
 
-`test_race_condition.py` and `test_get_account.py` are different from the three above — they fire real HTTP requests at the live API, so they must run against the already-running container, not a fresh one:
+`test_race_condition.py`, `test_get_account.py` and `test_health.py` are different from the three above — they fire real HTTP requests at the live API, so they must run against the already-running container, not a fresh one:
 
 ```bash
 docker compose exec api python -m app.test_race_condition
 docker compose exec api python -m app.test_get_account
+docker compose exec api python -m app.test_health
 ```
 
 ---
@@ -318,9 +340,8 @@ This runs entirely on free tiers:
 
 Being upfront about what's not done yet:
 
-- No `/health` endpoint.
 - No authentication on the API.
-- No automated test suite (pytest) yet — verification currently relies on the manual scripts described above (`test_idempotency.py`, `test_deadlock.py`, `test_failed_transaction.py`, `test_race_condition.py`,`test_get_account.py`).
+- No automated test suite (pytest) yet — verification currently relies on the manual scripts described above (`test_idempotency.py`, `test_deadlock.py`, `test_failed_transaction.py`, `test_race_condition.py`,`test_get_account.py`,`test_health.py`).
 - Single currency only (INR), enforced by a database constraint. Multi-currency support would need stored exchange rates, rounding rules, per-currency ledger lines and FX clearing accounts.
 - GCP deployment (Cloud Run + Neon + Upstash) is designed but not yet deployed from this repo.
 - No CI pipeline.
