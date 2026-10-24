@@ -1,4 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 import redis
 import json
@@ -7,7 +9,7 @@ import uuid
 from google.cloud import pubsub_v1
 
 from . import schemas, crud
-from .redis_client import get_redis
+from .redis_client import get_redis, ping_redis
 from .database import get_db
 
 app = FastAPI(title="FinTech Ledger API (Decoupled)")
@@ -145,4 +147,40 @@ def get_account_details(account_id: uuid.UUID, db: Session = Depends(get_db)):
         type=account.type.value,
         balance_cents=account.balance,
         currency=account.currency,
+    )
+
+
+@app.get("/health")
+def health():
+    # LIVENESS: "is the process running?" Deliberately checks NOTHING
+    # external. If this depended on Postgres or Redis, an outage in either
+    # would make every healthy API container look dead, and an orchestrator
+    # would restart them all without fixing anything.
+    return {"status": "ok"}
+
+
+@app.get("/health/ready")
+def health_ready(db: Session = Depends(get_db)):
+    # READINESS: "can this instance actually serve requests right now?"
+    # Each dependency is checked independently so one failure doesn't hide
+    # the other. Only the exception TYPE is reported, never its message,
+    # because driver errors can contain hostnames or connection details.
+    checks = {}
+
+    try:
+        db.execute(text("SELECT 1"))
+        checks["database"] = "ok"
+    except Exception as e:
+        checks["database"] = f"error: {type(e).__name__}"
+
+    try:
+        ping_redis()
+        checks["redis"] = "ok"
+    except Exception as e:
+        checks["redis"] = f"error: {type(e).__name__}"
+
+    healthy = all(v == "ok" for v in checks.values())
+    return JSONResponse(
+        status_code=200 if healthy else 503,
+        content={"status": "ok" if healthy else "unavailable", "checks": checks},
     )
